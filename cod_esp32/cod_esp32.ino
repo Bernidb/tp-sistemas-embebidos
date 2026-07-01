@@ -4,10 +4,10 @@
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 #include <esp_wifi.h> 
+#include <WiFiManager.h> //nueva wifi control celu
+#include <LittleFS.h> // maneja archivos en memoria
 
-const char* ssid = "";          // <-- REVISAR TU WIFI
-const char* password = ""; // <-- REVISAR TU CONTRASEÑA
-const char* mqtt_server = ""; // <-- PONER LA IP DEL COMANDO 'hostname -I'
+const char* mqtt_server = "192.168.0.104"; // REVISAR: PONER LA IP DE LA RASPBERRY; hostname -I
 
 #define DHTPIN 4       
 #define DHTTYPE DHT11
@@ -28,6 +28,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 unsigned long tiempoAnterior = 0;
+unsigned long ultimoIntentoMqtt = 0; // NUEVA: Para controlar la reconexion sin frenar todo
 const long intervalo = 5000;
 
 float limiteTemp = 28.0; 
@@ -42,36 +43,79 @@ bool primeraLectura = true;
 bool forzarDibujo = true; 
 
 void setup_wifi() {
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) delay(500); 
-  
-  // <-- LÍNEA AGREGADA: Activa el ahorro de energía del módem Wi-Fi
+  WiFiManager wm;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Conectando WiFi...");
+
+  bool res = wm.autoConnect("ESP32_Berni"); 
+  if(!res) {
+    lcd.clear();
+    lcd.print("Fallo conexion");
+    delay(3000);
+    ESP.restart(); 
+  } 
+
+  lcd.clear();
+  lcd.print("WiFi OK!");
+  delay(1000);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM); 
 }
 
-// <-- FUNCIÓN AGREGADA: Escucha los mensajes que llegan desde el Dashboard
 void callback(char* topic, byte* payload, unsigned int length) {
   String mensaje = "";
   for (int i = 0; i < length; i++) {
     mensaje += (char)payload[i];
   }
   
-  // Convertimos el mensaje recibido a número y pisamos el límite actual
   limiteTemp = mensaje.toFloat();
-  
-  // Forzamos a que la pantalla se actualice al instante para mostrar el nuevo límite
   forzarDibujo = true; 
-  Serial.println("Nuevo limite recibido desde la web: " + String(limiteTemp));
+  Serial.println("Nuevo limite recibido: " + String(limiteTemp));
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    if (client.connect("ESP32_Berni_SistEmb")) {
-      // <-- LÍNEA AGREGADA: Suscripción al tópico de control bidireccional
-      client.subscribe("facultad/lab_berni/control"); 
-      break;
+// funcion para guardar en memoria interna si no hay red
+void guardarDatoOffline(String dato) {
+  File file = LittleFS.open("/pendientes.txt", FILE_APPEND);
+  if (!file) {
+    Serial.println("Fallo al abrir archivo para guardar");
+    return;
+  }
+  file.println(dato);
+  file.close();
+  Serial.println("Red caida. Dato guardado offline.");
+}
+
+// funcion para vaciar la memoria al reconectar
+void enviarDatosPendientes() {
+  if (!LittleFS.exists("/pendientes.txt")) return;
+
+  File file = LittleFS.open("/pendientes.txt", FILE_READ);
+  if (!file) return;
+
+  Serial.println("Reconectado. Enviando datos atrasados...");
+  while (file.available()) {
+    String linea = file.readStringUntil('\n');
+    linea.trim();
+    if (linea.length() > 0) {
+      client.publish("facultad/lab_berni/telemetria", linea.c_str());
+      delay(50); // Pequeño respiro para no saturar el broker MQTT
     }
-    delay(5000);
+  }
+  file.close();
+  LittleFS.remove("/pendientes.txt"); // borrra el archivo viejo
+  Serial.println("Datos atrasados enviados con exito.");
+}
+
+void mantenerConexion() {
+  if (!client.connected()) {
+    if (millis() - ultimoIntentoMqtt > 5000) {
+      ultimoIntentoMqtt = millis();
+      Serial.println("Intentando conectar a MQTT...");
+      if (client.connect("ESP32_Berni_SistEmb")) {
+        client.subscribe("facultad/lab_berni/control"); 
+        enviarDatosPendientes(); // apenas conecta, dispara los atrasados
+      }
+    }
   }
 }
 
@@ -103,27 +147,34 @@ void setup() {
     pinMode(colPins[i], INPUT_PULLDOWN); 
   }
 
+  // Inicializar sistema de archivos
+  if (!LittleFS.begin(true)) {
+    Serial.println("Error montando memoria interna");
+  }
+
   lcd.init();      
   lcd.backlight(); 
   lcd.print("Iniciando...");
-  setup_wifi();
+  
+  setup_wifi(); 
   
   client.setServer(mqtt_server, 1883);
-  // <-- LÍNEA AGREGADA: Vincula el cliente MQTT con la función receptora
   client.setCallback(callback); 
   
   lcd.clear();
 }
 
 void loop() {
-  if (!client.connected()) reconnect();
-  client.loop();
+  mantenerConexion(); // Llama a la nueva función no bloqueante
+  if (client.connected()) {
+    client.loop();
+  }
 
   bool actualizarPantalla = forzarDibujo; 
   forzarDibujo = false; 
   unsigned long tiempoActual = millis();
 
-  // 1. LECTURA Y FILTRO EMA (Cada 5s)
+  // 1. LECTURA Y FILTRO EMA
   if (tiempoActual - tiempoAnterior >= intervalo) {
     tiempoAnterior = tiempoActual;
     float t_cruda = dht.readTemperature(); 
@@ -137,7 +188,6 @@ void loop() {
         tempFiltrada = (0.3 * t_cruda) + (0.7 * tempFiltrada); 
       }
 
-      // Lógica de Histéresis
       if (modoAuto) {
         if (tempFiltrada >= limiteTemp) {
           releActivo = true;
@@ -148,7 +198,6 @@ void loop() {
       digitalWrite(PIN_LED, releActivo ? HIGH : LOW);
       actualizarPantalla = true; 
 
-      // Armado y envío del JSON
       StaticJsonDocument<200> doc;
       doc["temp"] = tempFiltrada; 
       doc["hum"] = h;
@@ -157,7 +206,13 @@ void loop() {
 
       char buffer[256];
       serializeJson(doc, buffer);
-      client.publish("facultad/lab_berni/telemetria", buffer); 
+      
+      // si hay red lo manda, si no lo guarda en la memoria
+      if (client.connected()) {
+        client.publish("facultad/lab_berni/telemetria", buffer); 
+      } else {
+        guardarDatoOffline(buffer);
+      }
     }
   }
 
@@ -199,7 +254,7 @@ void loop() {
       lcd.print(modoStr + " -> " + estadoStr + "    "); 
     } else {
       lcd.setCursor(0, 0); lcd.print("Ingrese limite: "); 
-      lcd.setCursor(0, 1); lcd.print("> " + inputTeclado + "             "); 
+      lcd.setCursor(0, 1); lcd.print("> " + inputTeclado + "            "); 
     }
   }
 }

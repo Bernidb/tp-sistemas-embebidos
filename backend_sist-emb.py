@@ -17,6 +17,11 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Se ejecuta CADA VEZ que se conecta al broker
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    print("Conectado al broker MQTT. Suscribiendo al tópico...")
+    client.subscribe("facultad/lab_berni/telemetria")
+
 def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode('utf-8')
@@ -37,10 +42,11 @@ def on_message(client, userdata, msg):
         print(f"Error procesando mensaje: {e}")
 
 init_db()
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-client.on_message = on_message
-client.connect("localhost", 1883, 60)
-client.subscribe("facultad/+/telemetria")
 
-print("Servidor escuchando y grabando... (Ctrl+C para salir)")
+# Mantengo la inicialización con CallbackAPIVersion que venías usando
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+client.on_connect = on_connect  # Asignamos el evento de reconexión
+client.on_message = on_message
+
+client.connect("127.0.0.1", 1883, 60)
 client.loop_forever()

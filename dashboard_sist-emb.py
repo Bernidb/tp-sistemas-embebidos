@@ -22,7 +22,6 @@ try:
     if not df.empty:
         ultima_lectura = df.iloc[0]
         
-        # --- LÓGICA DE HEARTBEAT (Watchdog) ---
         formato = '%Y-%m-%d %H:%M:%S'
         ultima_fecha = datetime.strptime(ultima_lectura['fecha'], formato)
         ahora = datetime.now()
@@ -50,7 +49,20 @@ try:
         df_mostrar['temp'] = df_mostrar['temp'].round(2)
         st.dataframe(df_mostrar.head(5), use_container_width=True)
 
-        # --- NUEVO: PANEL DE CONTROL BIDIRECCIONAL ---
+        # boton de descarga a csv
+        st.markdown("---")
+        st.subheader("Exportar Datos")
+        # Convertimos el DataFrame a un archivo CSV
+        csv = df.to_csv(index=False).encode('utf-8')
+        
+        st.download_button(
+            label="Descargar Histórico en CSV",
+            data=csv,
+            file_name='historico_temperatura.csv',
+            mime='text/csv',
+        )
+
+        # Modificador temp limite
         st.markdown("---")
         st.subheader("Panel de Control Remoto")
         st.write("Modificá el límite de temperatura de la ESP32 desde acá:")
